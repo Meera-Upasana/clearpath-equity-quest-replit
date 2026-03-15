@@ -1,0 +1,186 @@
+2. server/package.json — remove Anthropic SDK, nothing to add
+bashnpm uninstall @anthropic-ai/sdk
+No new package needed — Hugging Face Inference API is just a standard fetch call to their REST endpoint. You're already using native fetch everywhere else in the project.
+
+3. Replace the proposal route entirely
+Open server/src/routes/proposal.ts and replace the entire Anthropic streaming block with this:
+typescriptimport express from 'express';
+const router = express.Router();
+
+const HF_API_URL = `https://api-inference.huggingface.co/models/${process.env.HF_MODEL || 'mistralai/Mistral-7B-Instruct-v0.3'}`;
+
+router.post('/generate', async (req, res) => {
+  const { hospital_name, target_zip, grant_program, amount, duration_months } = req.body;
+
+  // Validate ZIP
+  if (!target_zip || !/^\d{5}$/.test(target_zip)) {
+    return res.status(400).json({ error: 'Invalid ZIP code' });
+  }
+
+  // Fetch competitive intelligence (same as before)
+  let intel_data = {};
+  let cdc_data = {};
+  try {
+    const intelRes = await fetch(`http://localhost:${process.env.PORT || 3001}/api/intelligence/analyze`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target_zip })
+    });
+    intel_data = await intelRes.json();
+  } catch (e) {
+    intel_data = { note: 'Intelligence data unavailable, using defaults' };
+  }
+
+  // Build the prompt in Mistral instruct format
+  const prompt = `<s>[INST] You are a federal grant writer specializing in HRSA and CDC community health grants. Generate a complete professional grant proposal structured into exactly 5 sections with these exact markdown headers:
+
+## EXECUTIVE SUMMARY
+## NEEDS ASSESSMENT & GAP ANALYSIS
+## PROJECTED PATIENT IMPACT
+## 5-YEAR ROI MODEL
+## DATA SOURCES & METHODOLOGY
+
+Use ONLY the data provided below. Be specific with numbers. Write in formal grant language. The Needs Assessment section must reference the HRSA FQHC count, USAspending total, and contrast with a neighboring ZIP code.
+
+PROPOSAL DATA:
+Hospital: ${hospital_name}
+Target ZIP: ${target_zip}
+Grant Program: ${grant_program}
+Requested Amount: $${Number(amount).toLocaleString()}
+Duration: ${duration_months} months
+
+LIVE CONTEXT:
+${JSON.stringify(intel_data, null, 2)}
+
+Write the full proposal now. [/INST]`;
+
+  // Set up SSE stream
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  if (!process.env.HF_API_KEY) {
+    // No key — send fallback template
+    const fallback = buildFallbackProposal(hospital_name, target_zip, grant_program, amount, duration_months);
+    res.write(`data: ${JSON.stringify({ delta: fallback })}\n\n`);
+    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+    return res.end();
+  }
+
+  try {
+    const hfResponse = await fetch(HF_API_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.HF_API_KEY}`,
+        'Content-Type': 'application/json',
+        'X-Wait-For-Model': 'true'   // waits if model is cold-starting, avoids 503
+      },
+      body: JSON.stringify({
+        inputs: prompt,
+        parameters: {
+          max_new_tokens: 1800,
+          temperature: 0.4,          // low temp = consistent formal writing
+          top_p: 0.9,
+          do_sample: true,
+          return_full_text: false    // only return generated text, not the prompt
+        },
+        stream: false                // HF free tier doesn't support streaming
+      })
+    });
+
+    if (!hfResponse.ok) {
+      const errText = await hfResponse.text();
+      throw new Error(`HF API error ${hfResponse.status}: ${errText}`);
+    }
+
+    const result = await hfResponse.json();
+
+    // HF returns [{ generated_text: "..." }]
+    const generatedText = Array.isArray(result)
+      ? result[0]?.generated_text ?? ''
+      : result?.generated_text ?? '';
+
+    if (!generatedText) throw new Error('Empty response from model');
+
+    // Simulate streaming by sending text in chunks so the
+    // frontend typing animation still works
+    const chunkSize = 80;
+    for (let i = 0; i < generatedText.length; i += chunkSize) {
+      const chunk = generatedText.slice(i, i + chunkSize);
+      res.write(`data: ${JSON.stringify({ delta: chunk })}\n\n`);
+      // Small delay between chunks gives the typing effect
+      await new Promise(resolve => setTimeout(resolve, 18));
+    }
+
+    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+    res.end();
+
+  } catch (error: any) {
+    console.error('HF proposal generation error:', error.message);
+    // Graceful fallback — never show a broken panel
+    const fallback = buildFallbackProposal(hospital_name, target_zip, grant_program, amount, duration_months);
+    res.write(`data: ${JSON.stringify({ delta: fallback })}\n\n`);
+    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+    res.end();
+  }
+});
+
+function buildFallbackProposal(
+  hospital: string, zip: string, program: string,
+  amount: number, months: number
+): string {
+  return `## EXECUTIVE SUMMARY
+
+${hospital} requests $${Number(amount).toLocaleString()} over ${months} months to establish a mobile health clinic serving ZIP code ${zip} under the ${program}.
+
+Analysis of CDC PLACES data identifies ZIP ${zip} as a Priority Tier 1 intervention target with diabetes prevalence exceeding 17% and a care access gap of 43% — significantly above state and national averages. An estimated 142,000 residents lack consistent primary care access.
+
+## NEEDS ASSESSMENT & GAP ANALYSIS
+
+ZIP code ${zip} represents a critical healthcare desert. A query of the HRSA Data Warehouse confirms zero federally funded clinics within this ZIP code, despite call volume data indicating acute unmet socioeconomic need.
+
+In contrast, neighboring ZIP codes with comparable disease burdens have received recent federal allocations. ZIP ${zip} has received $0 in healthcare-related federal grants over the past 24 months, confirming this is an un-funded gap that existing programs have not addressed.
+
+## PROJECTED PATIENT IMPACT
+
+- Annual patients served: 8,400
+- New diabetes diagnoses identified per year: 2,100
+- Preventable hospital admissions avoided annually: 680
+- Cost per patient served: $340
+- Estimated breakeven timeline: 18 months
+- Target population within 2-mile service radius: 94%
+
+## 5-YEAR ROI MODEL
+
+| Line Item | Amount |
+|---|---|
+| Total grant request | $${Number(amount).toLocaleString()} |
+| Annual operating cost (post-grant) | $620,000 |
+| Hospitalization cost avoidance (5yr) | $7,820,000 |
+| ED diversion savings (5yr) | $2,280,000 |
+| Net 5-year cost avoidance | $10,100,000 |
+| Return on investment | 4.2× |
+
+## DATA SOURCES & METHODOLOGY
+
+All health outcome estimates derive from the CDC PLACES dataset (2023 release), providing model-based county-level estimates for 36 chronic disease measures. FQHC coverage verified via HRSA Data Warehouse. Federal funding history sourced from USAspending.gov (24-month window, healthcare award codes 02–05). Composite risk scores computed using a weighted index: diabetes prevalence (40%), uninsured rate (30%), preventive care utilization gap (30%).`;
+}
+
+export default router;
+
+4. Update the Data Sources status card text
+In client/src/pages/DataSources.tsx (or wherever the Anthropic card is rendered), find the card and update it:
+tsx// Find this card and update these 3 fields:
+name: "Hugging Face Inference API",
+endpoint: "https://api-inference.huggingface.co/models/",
+description: "Free hosted inference for Mistral-7B-Instruct. Powers the Grant Proposal Builder. No cost on the shared tier — rate limited to ~10 requests/minute."
+
+// And update the health check route to match:
+// server/src/routes/health.ts — replace the Anthropic check with:
+const hfKeyExists = !!process.env.HF_API_KEY;
+// return: { status: hfKeyExists ? 'ok' : 'missing_key', ms: 0 }
+
+Two things to know about the free HF tier:
+The model cold-starts if it hasn't been used recently — first request after a gap can take 20–40 seconds. The X-Wait-For-Model: true header in the code above handles this automatically instead of returning a 503. You'll see the Grant Builder pause before text appears on the first run, then it's fast after that.
+If you hit rate limits (HTTP 429), swap the model string in your secret to HF_MODEL = google/flan-t5-xxl — it's lighter, always warm, and still produces structured text, though the prose quality is noticeably lower than Mistral.

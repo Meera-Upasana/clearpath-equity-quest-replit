@@ -1,0 +1,165 @@
+I have a React + TypeScript health equity platform called "ClearPath Health" built in Lovable. I need to migrate it to Replit and make all data live using real public APIs. Here is the complete technical specification.
+
+---
+
+PROJECT STRUCTURE
+
+Set up a full-stack monorepo:
+/client  → Vite + React + TypeScript (migrate existing Lovable frontend)
+/server  → Node.js + Express + TypeScript (new API proxy + MCP layer)
+/shared  → Shared TypeScript types used by both
+
+Root: package.json with concurrently running both client (port 5173) and server (port 3001).
+
+---
+
+SERVER: EXPRESS API PROXY
+
+Create /server/src/index.ts — Express server with the following route modules:
+
+1. /api/cdc-places
+GET /api/cdc-places/states
+- Fetches from: https://chronicdata.cdc.gov/resource/swc5-untb.json
+- Query params to forward: $where, $select, $limit (default 5000)
+- Returns: Array of {locationabbr, locationdesc, category, measure, data_value, year}
+- Cache: In-memory cache with 24-hour TTL using node-cache
+- Error handling: On API failure, fall back to hardcoded static data file /server/src/fallback/cdc-static.ts
+
+GET /api/cdc-places/zip/:zipcode
+- Fetches county-level CDC data for a given ZIP's county FIPS
+- Uses ZIP→county crosswalk table (include hardcoded top 500 US ZIP codes)
+
+2. /api/hrsa
+GET /api/hrsa/fqhcs/:zipcode
+- Fetches from: https://data.hrsa.gov/api/download?fileNm=FQHC_SITES&fileType=json OR https://findahealthcenter.hrsa.gov/api/
+- Returns: Array of {site_name, address, city, state, zip, lat, lng, health_center_type}
+- Filter to within 10-mile radius of input ZIP using Haversine formula
+- Include ZIP centroid lookup table for top 1000 US ZIPs
+
+GET /api/hrsa/coverage-summary/:zipcode
+- Returns: {zip, fqhc_count, nearest_fqhc_miles, coverage_tier: 'desert'|'limited'|'adequate'}
+
+3. /api/usaspending
+GET /api/usaspending/grants/:zipcode
+- Fetches from: https://api.usaspending.gov/api/v2/search/spending_by_geography/
+- POST body: {scope: "place_of_performance", geo_layer: "zip", filters: {keywords: ["healthcare","mobile clinic","diabetes","chronic disease"], time_period: [{start_date: "2022-01-01", end_date: "2024-12-31"}], place_of_performance_locations: [{country: "USA", zip: zipcode}]}}
+- Returns: {zip, total_awards, total_amount, top_recipients: [{name, amount, award_date}]}
+- Cache: 6-hour TTL
+
+POST /api/usaspending/compare
+- Body: {zipcodes: string[]}
+- Runs the above query for each ZIP concurrently (Promise.all)
+- Returns ranked comparison array sorted by total_amount desc
+
+4. /api/competitive-intelligence
+POST /api/competitive-intelligence/analyze
+- Body: {target_zip: string, comparison_zips: string[]}
+- Orchestrates: calls HRSA + USAspending in parallel for each ZIP
+- Synthesizes result object: {winner_zip, reasoning_factors: [], fqhc_gaps: [], funding_gaps: [], recommendation_tier: 'priority_1'|'priority_2'|'monitor'}
+- This is the core MCP orchestration endpoint
+
+5. /api/grant-proposal
+POST /api/grant-proposal/generate
+- Body: {hospital_name, target_zip, grant_program, amount, duration_months}
+- Calls /api/competitive-intelligence/analyze internally first
+- Uses Anthropic Claude API (claude-sonnet-4-20250514) to generate the full grant proposal text
+- System prompt: "You are a federal grant writer specializing in HRSA and CDC community health grants. Generate a complete, professional grant proposal. Use ONLY the data provided in the user message. Format as structured sections with headers. Be specific with numbers and cite the data sources."
+- User message: Inject all live data fetched from CDC PLACES, HRSA, USAspending into the prompt as a structured JSON context block
+- Returns: {executive_summary, needs_assessment, patient_impact, roi_model, methodology} as separate string fields
+- Stream the response using SSE (server-sent events) so the frontend can show typing animation
+
+6. /api/health
+GET /api/health
+- Returns status of all 4 upstream APIs by making lightweight test calls
+- Returns: {cdc: 'ok'|'error', hrsa: 'ok'|'error', usaspending: 'ok'|'error', anthropic: 'ok'|'error', timestamp}
+
+---
+
+CLIENT: FRONTEND UPDATES
+
+Update the existing React components to replace all static hardcoded data with live API calls:
+
+1. Create /client/src/hooks/useCDCData.ts
+- useQuery (React Query / TanStack Query) wrapping GET /api/cdc-places/states
+- Accepts metric: 'diabetes'|'obesity'|'smoking'|'hypertension'|'mental_health'|'no_checkup'
+- Transforms raw CDC response into {stateCode: string, value: number}[] for the choropleth map
+- Shows skeleton loading state on the map while fetching
+- On error: silently falls back to static data, shows small amber "Using cached data" badge
+
+2. Create /client/src/hooks/useCompetitiveAnalysis.ts
+- useMutation wrapping POST /api/competitive-intelligence/analyze
+- Takes {target_zip, comparison_zips}
+- Returns full analysis object
+- On success: updates the 3 competitive intelligence cards on the Map Intelligence screen
+
+3. Create /client/src/hooks/useGrantProposal.ts
+- Handles SSE stream from POST /api/grant-proposal/generate
+- Uses EventSource or fetch with ReadableStream
+- Updates proposal text section by section as it streams in (executive_summary arrives first, then needs_assessment, etc.)
+- Shows blinking cursor at the end of the currently-streaming section
+
+4. Update Map Intelligence screen
+- Add a ZIP Code Search bar at the top: input + "Analyze" button
+- On submit: calls useCompetitiveAnalysis with the entered ZIP vs 3 nearest ZIPs (compute from hardcoded ZIP centroid table)
+- Adds a new visual layer on the SVG map: green circle = FQHC present, red X = no FQHC (plot these at state centroids as proxies)
+- Updates the 3 competitive intelligence cards with live data
+
+5. Update Data Sources screen
+- Wire "Test Connection" buttons to GET /api/health
+- Show real response time in milliseconds next to each status badge
+- Add a "Last Refreshed" timestamp that updates every 60 seconds
+
+6. Update Grant Proposal Builder
+- "Generate Proposal" button now calls useGrantProposal hook
+- Show streaming text with a typing animation (blinking cursor) as each section arrives via SSE
+- Disable form inputs while generation is in progress
+- Add a toast notification: "Fetching live data from CDC PLACES, HRSA, and USAspending.gov..." → "Sending to AI writer..." → "Proposal complete."
+
+---
+
+ENVIRONMENT VARIABLES
+
+Create .env.example:
+ANTHROPIC_API_KEY=your_key_here
+PORT=3001
+NODE_ENV=development
+CDC_CACHE_TTL_HOURS=24
+USASPENDING_CACHE_TTL_HOURS=6
+HRSA_CACHE_TTL_HOURS=12
+
+In Replit: add all secrets via the Secrets panel. Never commit API keys.
+
+---
+
+ERROR HANDLING PHILOSOPHY
+
+Every API call must degrade gracefully:
+- CDC PLACES offline → use /server/src/fallback/cdc-static.ts (the full 51-state dataset hardcoded)
+- HRSA offline → return {fqhc_count: null, coverage_tier: 'unknown'}, show "Live data unavailable" in the card
+- USAspending offline → return {total_amount: null}, show "Funding data unavailable"
+- Anthropic offline → return a pre-written template proposal with [PLACEHOLDER] tokens for the admin to fill in manually
+
+---
+
+CORS & SECURITY
+
+- Express: cors({origin: process.env.CLIENT_URL || 'http://localhost:5173'})
+- Rate limit all /api/* routes: 100 requests per 15 minutes per IP using express-rate-limit
+- Sanitize all ZIP code inputs: must match /^\d{5}$/ regex before forwarding to upstream APIs
+- No API keys ever sent to the client — all upstream calls happen server-side only
+
+---
+
+DEPLOYMENT ON REPLIT
+
+Configure replit.nix or .replit:
+- run = "npm run dev" (concurrently runs client + server)
+- Reserve port 3001 for server, 5173 for client
+- Set up a Replit Always-On workflow so the server stays live
+- Add a /ping endpoint that Replit's health check can hit
+
+Final deliverable: a fully live, production-grade health equity intelligence tool where:
+1. The choropleth map shows real CDC PLACES data refreshed daily
+2. Any ZIP code entered triggers live HRSA + USAspending lookups
+3. The Grant Proposal Builder uses Claude to write a real, data-backed proposal in real time
+4. All 4 data source connections show live green/red status
